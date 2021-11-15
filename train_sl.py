@@ -1,0 +1,272 @@
+import os, sys
+import numpy as np
+from tqdm import tqdm
+from itertools import islice
+import yaml
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from models.resnet import ResNet
+from utils.help import load_yaml
+import utils.metrics
+import torchvision.datasets
+
+import torchvision.models as models
+import torchvision.transforms as transforms
+from dataloaders.cifardataset import MyDataset
+
+from torch.utils.data import DataLoader
+from torch.utils.data.dataloader import default_collate
+from torch.utils.tensorboard import SummaryWriter
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# from lshash.lshash import LSHash
+import logging
+
+import utils
+import models
+import dataloaders
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+from evaluate import validate, test
+
+# if torch.cuda.is_available():
+#     dtype = torch.cuda.FloatTensor
+# else:
+dtype = torch.FloatTensor
+
+torch.set_default_tensor_type(dtype)
+
+
+# %%
+
+# def train(epoch, model, device, dataloader, optimizer, scheduler, criterion, experiment_dir, writer):
+def train(epoch, model, device, dataloader, optimizer, scheduler, criterion, experiment_dir):
+    """ Train loop, predict rotations. """
+    global iter_cnt
+    #    progbar = tqdm(total=len(dataloader), desc='Train')
+    #     progbar = tqdm(total=10, desc='Train')
+
+    loss_record = utils.metrics.RunningAverage()
+    acc_record = utils.metrics.RunningAverage()
+    correct = 0
+    total = 0
+    save_path = experiment_dir + '/'
+    os.makedirs(save_path, exist_ok=True)
+    model.train()
+    #   for batch_idx, (data,label,_,_) in enumerate(tqdm(islice(dataloader,10))):
+    for idx, data in enumerate(tqdm(dataloader)):
+        data, label = data
+        # optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, label)
+
+        # measure accuracy and record loss
+        confidence, predicted = output.max(1)
+        correct += predicted.eq(label).sum().item()
+        # acc = utils.compute_acc(output, label)
+        total += label.size(0)
+        acc = correct / total
+
+        acc_record.update(100 * acc)
+        loss_record.update(loss.item())
+
+        # writer.add_scalar('train/Loss_batch', loss.item(), iter_cnt)
+        # writer.add_scalar('train/Acc_batch', acc, iter_cnt)
+        iter_cnt += 1
+
+        #        logging.info('Train Step: {}/{} Loss: {:.4f}; Acc: {:.4f}'.format(batch_idx,len(dataloader), loss_record(), acc_record()))
+
+        # compute gradient and do optimizer step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # progbar.set_description('Train (loss=%.4f)' % (loss_record()))
+        # progbar.update(1)
+
+    if scheduler:
+        scheduler.step()
+
+    LR = optimizer.param_groups[0]['lr']
+
+    # writer.add_scalar('train/Loss_epoch', loss_record(), epoch)
+    # writer.add_scalar('train/Acc_epoch', acc_record(), epoch)
+    logging.info(
+        'Train Epoch: {} LR: {:.4f} Avg Loss: {:.4f}; Avg Acc: {:.4f}'.format(epoch, LR, loss_record(), acc_record()))
+    print("train acc: ", acc_record())
+
+    return loss_record, acc_record
+
+
+# %%
+def train_and_evaluate(cfg):
+    # Training settings
+    experiment_dir = os.path.join('experiments_dir')
+    # if not os.path.exists(experiment_dir):
+    #     os.makedirs(experiment_dir)
+
+    # utils.set_logger(os.path.join(experiment_dir, cfg.log))
+    # logging.info('-----------Starting Experiment------------')
+    use_cuda = cfg.use_cuda and torch.cuda.is_available()
+    cfg.use_cuda = use_cuda
+    device = torch.device("cuda:{}".format(cfg.cuda_num) if use_cuda else "cpu")
+    # initialize the tensorbiard summary writer
+    # writer = SummaryWriter(experiment_dir + '/tboard' )
+    # logs = os.path.join('experiments', cfg.exp_type, 'tboard_sup_demo')
+    # writer = SummaryWriter(logs + '/rotnet_without_pretrain' )
+
+    ## get the dataloaders
+    transform = transforms.Compose(
+        [transforms.ToTensor(),  # 传入数据转化成张量形式
+         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # 定义归一化方法
+         # transforms.Normalize((mean),(std)):用给定的均值和标准差对每个通道数据进行归一化：
+         # 归一方式：  (input[channel]-mean[channel])/std[channel]
+         ]
+    )
+    trainset = torchvision.datasets.CIFAR100(root='./dataset/cifar100', train=True, download=True, transform=transform)
+    dloader_train = torch.utils.data.DataLoader(trainset, batch_size=4, shuffle=True, num_workers=0)
+    testset = torchvision.datasets.CIFAR100(root='./dataset/cifar100', train=False, download=True, transform=transform)
+    dloader_test = torch.utils.data.DataLoader(testset, batch_size=4, shuffle=False, num_workers=0)
+    dloader_val = dloader_test
+
+    # Load the model
+    model = ResNet(cfg)
+    model = model.to(device)
+
+    #    for name, param in model.named_parameters():
+    #       param.requires_grad = False
+    #      print(name)
+
+    # model.avgpool=nn.AdaptiveAvgPool2d(output_size=(1, 1))
+    # model.fc=nn.Linear(in_features=512, out_features=5, bias=True)
+    if cfg.use_ssl:
+        # ssl_exp_dir = os.path.join('save_path', cfg.ssl_pretrained_exp_path)
+        state_dict = torch.load(os.path.join('save_path', cfg.ssl_pretrained_exp_path), \
+                                map_location=device)
+        # the stored dict has 3 informations - epoch,state_dict and optimizer
+        state_dict = state_dict['model_state_dict']
+        print(state_dict.keys())
+        del state_dict['fc_change.fc.0.weight']
+        del state_dict['fc_change.fc.0.bias']
+        del state_dict['fc_change.fc.2.weight']
+        del state_dict['fc_change.fc.2.bias']
+        del state_dict['fc_change.fc.4.weight']
+        del state_dict['fc_change.fc.4.bias']
+        del state_dict['encoder.fc.weight']
+        del state_dict['encoder.fc.bias']
+        #
+        # del state_dict['layer4.0.conv1.weight']
+        # del state_dict['layer4.0.conv2.weight']
+        # del state_dict['layer4.1.conv1.weight']
+        # del state_dict['layer4.1.conv2.weight']
+        #
+        # del state_dict['layer3.0.conv1.weight']
+        # del state_dict['layer3.0.conv2.weight']
+        # del state_dict['layer3.1.conv1.weight']
+        # del state_dict['layer3.1.conv2.weight']
+
+        # del state_dict['layer2.0.conv1.weight']
+        # del state_dict['layer2.0.conv2.weight']
+        # del state_dict['layer2.1.conv1.weight']
+        # del state_dict['layer2.1.conv2.weight']
+
+        model.load_state_dict(state_dict, strict=False)
+
+        # Only finetune fc layer
+        # layers_list=['fc','avgpool','layer3.0.conv']#,'layer3.1.conv','layer4.0.conv','layer4.1.conv']
+        # params_update=[]
+        for name, param in model.named_parameters():
+            # for l in layers_list:
+            # if 'fc' or 'layer3.0.conv' or 'layer3.1.conv' or'layer4.0.conv' or 'layer4.1.conv' in name:
+            if 'encoder.fc' in name:
+                param.requires_grad = True
+            ###                    print(name)
+            else:
+                param.requires_grad = False
+    #                    print(name)
+    # params_update.append(param)
+    #            print(param.requires_grad)
+
+    model = model.to(device)
+
+    # images,_ ,_,_ = next(iter(dloader_train))
+    # images = images.to(device)
+    # writer.add_graph(model, images)
+
+    # follow the same setting as RotNet paper
+    # model.parameters()
+    if cfg.opt == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=float(cfg.lr), momentum=float(cfg.momentum), weight_decay=5e-4,
+                              nesterov=True)
+    elif cfg.opt == 'adam':
+        optimizer = optim.Adam(model.parameters(),
+                               lr=float(cfg.lr))  # , momentum=float(cfg.momentum), weight_decay=5e-4, nesterov=True)
+
+    if cfg.scheduler:
+        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 200], gamma=0.2)
+    else:
+        scheduler = None
+    criterion = nn.CrossEntropyLoss()
+
+    global iter_cnt
+    iter_cnt = 0
+    best_loss = 1000
+    for epoch in range(cfg.num_epochs):
+
+        #        print('\nTrain for Epoch: {}/{}'.format(epoch,cfg.num_epochs))
+        logging.info('\nTrain for Epoch: {}/{}'.format(epoch, cfg.num_epochs))
+        # train_loss,train_acc = train(epoch, model, device, dloader_train, optimizer, scheduler, criterion, experiment_dir, writer)
+        train_loss, train_acc = train(epoch, model, device, dloader_train, optimizer, scheduler, criterion, experiment_dir)
+        # validate after every epoch
+        #        print('\nValidate for Epoch: {}/{}'.format(epoch,cfg.num_epochs))
+        logging.info('\nValidate for Epoch: {}/{}'.format(epoch, cfg.num_epochs))
+        # val_loss,val_acc = validate(epoch, model, device, dloader_val, criterion, experiment_dir, writer)
+        val_loss, val_acc = validate(epoch, model, device, dloader_val, criterion)
+        logging.info('Val Epoch: {} Avg Loss: {:.4f} \t Avg Acc: {:.4f}'.format(epoch, val_loss, val_acc))
+
+        # for name, weight in model.named_parameters():
+        #    writer.add_histogram(name,weight, epoch)
+        #   writer.add_histogram(f'{name}.grad',weight.grad, epoch)
+
+        is_best = val_loss < best_loss
+        best_loss = min(val_loss, best_loss)
+        if epoch % cfg.save_intermediate_weights == 0 or is_best:
+            utils.help.save_checkpoint({'Epoch': epoch, 'state_dict': model.state_dict(),
+                                   'optim_dict': optimizer.state_dict()},
+                                  is_best, experiment_dir,
+                                  checkpoint='{}_epoch{}_checkpoint.pth'.format(cfg.network.lower(), str(epoch)), \
+ \
+                                  best_model='{}_best.pth'.format(cfg.network.lower())
+                                  )
+    # writer.close()
+
+    #    print('\nEvaluate on test')
+    # logging.info('\nEvaluate test result on best ckpt')
+    state_dict = torch.load(os.path.join(experiment_dir, '{}_best.pth'.format(cfg.network.lower())), \
+                            map_location=device)
+    model.load_state_dict(state_dict, strict=False)
+
+    test_loss, test_acc = test(model, device, dloader_test, criterion)
+    logging.info('Test: Avg Loss: {:.4f} \t Avg Acc: {:.4f}'.format(test_loss, test_acc))
+
+    # save the configuration file within that experiment directory
+    utils.help.save_yaml(cfg, save_path=os.path.join(experiment_dir, 'config_sl.yaml'))
+    logging.info('-----------End of Experiment------------')
+
+
+# %%
+if __name__ == '__main__':
+    config_file = 'config/config.yml'
+    cfg = utils.help.load_yaml(config_file, config_type='object')
+    train_and_evaluate(cfg)
+
+
+
+
+

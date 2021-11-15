@@ -1,0 +1,21 @@
+Root: 'cifar100'
+TRAIN_PATH: 'cifar100/train'
+VAL_PATH: 'cifar100/val'
+TEST_PATH: 'cifar100/test'
+subset_data: 100
+patch_dim: 10    # the dim of patch   15
+gap: 1   #3     the distance between two patch
+batch_size: 64
+num_epochs: 2
+lr: 0.0005
+root_path: 'D:\paper\Self_Supervised_Learning\codes\context'
+data_path: 'dataset'
+labels_dir: 'annotations'
+network: 'resnet18'
+num_classes: 8
+use_ssl: True
+ssl_pretrained_exp_path: '64_1_0.0005_100_10_1.pt'
+use_cuda: False
+opt: 'sgd'
+momentum: 9e-1
+save_intermediate_weights: 1
